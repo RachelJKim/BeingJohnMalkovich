@@ -11,7 +11,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.tw0b33rs.nativesensoraccess"
+        applicationId = "com.rachel.johnmalkovich"
         minSdk = 34
         targetSdk = 36
         versionCode = 1
@@ -72,6 +72,8 @@ dependencies {
     implementation(libs.androidx.compose)
     implementation(libs.androidx.runtime)
     implementation(libs.androidx.scenecore)
+    implementation(libs.google.webrtc)
+    implementation(libs.google.gson)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

@@ -31,6 +31,8 @@ add_library(${PROJECT_NAME} SHARED
     camera/camera_manager.cpp
     camera/camera_stream.h
     camera/camera_stream.cpp
+    camera/camera_encoder_bridge.h
+    camera/camera_encoder_bridge.cpp
 
     # JNI bridge
     jni/jni_helpers.h

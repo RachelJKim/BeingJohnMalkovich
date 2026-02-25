@@ -85,8 +85,10 @@ import com.tw0b33rs.nativesensoraccess.sensor.NavigationDestination
 import com.tw0b33rs.nativesensoraccess.sensor.SensorInfo
 import com.tw0b33rs.nativesensoraccess.sensor.SensorUiState
 import com.tw0b33rs.nativesensoraccess.sensor.SensorViewModel
+import com.tw0b33rs.nativesensoraccess.streaming.StreamingState
 import com.tw0b33rs.nativesensoraccess.ui.CameraClusterView
 import com.tw0b33rs.nativesensoraccess.ui.CameraPermissionRequest
+import com.tw0b33rs.nativesensoraccess.ui.StreamingContent
 import com.tw0b33rs.nativesensoraccess.ui.theme.NativeSensorAccessTheme
 
 class MainActivity : ComponentActivity() {
@@ -120,6 +122,11 @@ class MainActivity : ComponentActivity() {
                 // Start sensors when app launches
                 LaunchedEffect(Unit) {
                     viewModel.startSensors()
+                }
+
+                // Initialize WebRTC streaming
+                LaunchedEffect(Unit) {
+                    viewModel.initializeStreaming(context)
                 }
 
                 // Cleanup on dispose
@@ -282,6 +289,25 @@ fun AppWithNavigation(
                         modifier = Modifier.padding(24.dp)
                     )
                 }
+
+                NavigationDestination.Streaming -> {
+                    StreamingContent(
+                        streamingState = uiState.streamingState,
+                        remoteVideoTrack = uiState.remoteVideoTrack,
+                        remoteIp = uiState.remoteIp,
+                        onRemoteIpChanged = viewModel::updateRemoteIp,
+                        onStartSender = viewModel::startStreamingSender,
+                        onStartReceiver = viewModel::startStreamingReceiver,
+                        onStop = viewModel::stopStreaming,
+                        localCameraId = uiState.passthroughCluster.selectedCameraId,
+                        onLocalSurfaceReady = viewModel::startCameraPreview,
+                        onLocalSurfaceDestroyed = { viewModel.stopCameraPreview(it) },
+                        deviceIp = uiState.deviceIp,
+                        streamingError = uiState.streamingError,
+                        cameraCount = uiState.passthroughCluster.cameras.size,
+                        modifier = Modifier.padding(24.dp)
+                    )
+                }
             }
         }
     }
@@ -321,6 +347,7 @@ fun NavigationSidebar(
                     NavigationDestination.PassthroughCameras -> uiState.passthroughCluster.cameras.size
                     NavigationDestination.Avatar -> uiState.trackingCluster.cameras.size
                     NavigationDestination.EyeTrackingCameras -> uiState.eyeTrackingCluster.cameras.size
+                    NavigationDestination.Streaming -> if (uiState.streamingState == StreamingState.CONNECTED) 1 else 0
                 }
 
                 val showBadge = when (destination) {
@@ -329,7 +356,8 @@ fun NavigationSidebar(
                     }
                     NavigationDestination.PassthroughCameras,
                     NavigationDestination.Avatar,
-                    NavigationDestination.EyeTrackingCameras -> true
+                    NavigationDestination.EyeTrackingCameras,
+                    NavigationDestination.Streaming -> true
                 }
 
                 NavigationItem(

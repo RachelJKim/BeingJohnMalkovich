@@ -13,6 +13,8 @@ composeBom = "2025.07.00"
 compose = "1.0.0-alpha05"
 runtime = "1.0.0-alpha05"
 scenecore = "1.0.0-alpha05"
+webrtc = "1.2.1"
+gson = "2.10.1"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -35,6 +37,8 @@ androidx-compose-material3 = { group = "androidx.compose.material3", name = "mat
 androidx-compose = { group = "androidx.xr.compose", name = "compose", version.ref = "compose" }
 androidx-runtime = { group = "androidx.xr.runtime", name = "runtime", version.ref = "runtime" }
 androidx-scenecore = { group = "androidx.xr.scenecore", name = "scenecore", version.ref = "scenecore" }
+google-webrtc = { group = "io.getstream", name = "stream-webrtc-android", version.ref = "webrtc" }
+google-gson = { group = "com.google.code.gson", name = "gson", version.ref = "gson" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

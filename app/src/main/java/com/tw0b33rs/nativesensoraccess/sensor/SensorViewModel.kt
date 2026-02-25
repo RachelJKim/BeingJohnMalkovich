@@ -1,10 +1,15 @@
 package com.tw0b33rs.nativesensoraccess.sensor
 
+import android.content.Context
+import android.net.wifi.WifiManager
 import android.view.Surface
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.tw0b33rs.nativesensoraccess.logging.SensorLogExtensions.logPerformanceStats
 import com.tw0b33rs.nativesensoraccess.logging.SensorLogger
+import com.tw0b33rs.nativesensoraccess.streaming.StreamingState
+import com.tw0b33rs.nativesensoraccess.streaming.StreamingStateListener
+import com.tw0b33rs.nativesensoraccess.streaming.WebRTCManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -13,6 +18,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.webrtc.VideoTrack
 
 /**
  * Navigation destinations for sensor clusters.
@@ -22,7 +28,8 @@ enum class NavigationDestination(val title: String, val icon: String) {
     ImuSensors("IMU", "🧠"),
     PassthroughCameras("Passthrough", "👁"),
     Avatar("Avatar", "🤖"),
-    EyeTrackingCameras("Eye Tracking", "👀");
+    EyeTrackingCameras("Eye Tracking", "👀"),
+    Streaming("Stream", "📡");
 
     companion object {
         /** Primary navigation items shown in the sidebar */
@@ -30,7 +37,8 @@ enum class NavigationDestination(val title: String, val icon: String) {
             ImuSensors,
             PassthroughCameras,
             Avatar,
-            EyeTrackingCameras
+            EyeTrackingCameras,
+            Streaming
         )
 
         /** Default destination when navigation state is unclear */
@@ -78,7 +86,14 @@ data class SensorUiState(
     // Camera States per cluster
     val passthroughCluster: CameraClusterState = CameraClusterState(),
     val trackingCluster: CameraClusterState = CameraClusterState(),
-    val eyeTrackingCluster: CameraClusterState = CameraClusterState()
+    val eyeTrackingCluster: CameraClusterState = CameraClusterState(),
+
+    // Streaming state
+    val streamingState: StreamingState = StreamingState.DISCONNECTED,
+    val remoteIp: String = "",
+    val remoteVideoTrack: VideoTrack? = null,
+    val deviceIp: String = "",
+    val streamingError: String? = null
 ) {
     /**
      * Get cluster state for a destination.
@@ -88,7 +103,7 @@ data class SensorUiState(
         NavigationDestination.PassthroughCameras -> passthroughCluster
         NavigationDestination.Avatar -> trackingCluster
         NavigationDestination.EyeTrackingCameras -> eyeTrackingCluster
-        NavigationDestination.ImuSensors, null -> null
+        NavigationDestination.ImuSensors, NavigationDestination.Streaming, null -> null
     }
 }
 
@@ -122,7 +137,9 @@ class SensorViewModel : ViewModel() {
         // Stop current camera preview when leaving camera views
         val currentDest = _uiState.value.currentDestination
         if (currentDest != NavigationDestination.ImuSensors &&
-            destination == NavigationDestination.ImuSensors) {
+            currentDest != NavigationDestination.Streaming &&
+            (destination == NavigationDestination.ImuSensors ||
+             destination == NavigationDestination.Streaming)) {
             stopCameraPreview()
         }
 
@@ -369,8 +386,182 @@ class SensorViewModel : ViewModel() {
             NavigationDestination.EyeTrackingCameras -> _uiState.value.copy(
                 eyeTrackingCluster = _uiState.value.eyeTrackingCluster.copy(isStreaming = isStreaming)
             )
-            NavigationDestination.ImuSensors -> _uiState.value
+            NavigationDestination.ImuSensors,
+            NavigationDestination.Streaming -> _uiState.value
         }
+    }
+
+    // ==========================================================================
+    // Streaming
+    // ==========================================================================
+
+    private var webRTCManager: WebRTCManager? = null
+    private val streamLog = SensorLogger.Logger("NativeSensor.Stream")
+
+    /**
+     * Initialize WebRTC manager. Must be called with application context.
+     */
+    @Suppress("DEPRECATION")
+    fun initializeStreaming(context: Context) {
+        if (webRTCManager != null) return
+
+        // Get device IP for display
+        try {
+            val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            val ipInt = wifiManager.connectionInfo.ipAddress
+            if (ipInt != 0) {
+                val ip = "${ipInt and 0xFF}.${(ipInt shr 8) and 0xFF}.${(ipInt shr 16) and 0xFF}.${(ipInt shr 24) and 0xFF}"
+                _uiState.value = _uiState.value.copy(deviceIp = ip)
+                streamLog.info("Device IP: $ip")
+            } else {
+                // Try network interfaces as fallback
+                val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
+                for (intf in interfaces) {
+                    for (addr in intf.inetAddresses) {
+                        if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
+                            _uiState.value = _uiState.value.copy(deviceIp = addr.hostAddress ?: "")
+                            break
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            streamLog.warn("Could not get device IP", throwable = e)
+        }
+
+        webRTCManager = WebRTCManager(context.applicationContext, object : StreamingStateListener {
+            override fun onStateChanged(state: StreamingState) {
+                viewModelScope.launch(Dispatchers.Main) {
+                    _uiState.value = _uiState.value.copy(
+                        streamingState = state,
+                        streamingError = if (state == StreamingState.ERROR) _uiState.value.streamingError else null
+                    )
+                }
+            }
+
+            override fun onRemoteVideoTrackReceived(videoTrack: VideoTrack) {
+                streamLog.info("Remote video track received")
+                viewModelScope.launch(Dispatchers.Main) {
+                    _uiState.value = _uiState.value.copy(remoteVideoTrack = videoTrack)
+                }
+            }
+
+            override fun onRemoteVideoTrackRemoved() {
+                streamLog.info("Remote video track removed")
+                viewModelScope.launch(Dispatchers.Main) {
+                    _uiState.value = _uiState.value.copy(remoteVideoTrack = null)
+                }
+            }
+
+            override fun onError(message: String) {
+                streamLog.error("Streaming error: $message")
+                viewModelScope.launch(Dispatchers.Main) {
+                    _uiState.value = _uiState.value.copy(
+                        streamingError = message,
+                        streamingState = StreamingState.ERROR
+                    )
+                }
+            }
+        })
+
+        try {
+            webRTCManager?.initialize()
+            streamLog.info("WebRTC manager initialized")
+        } catch (e: Exception) {
+            streamLog.error("Failed to initialize WebRTC", throwable = e)
+            _uiState.value = _uiState.value.copy(
+                streamingError = "WebRTC init failed: ${e.message}"
+            )
+            webRTCManager = null
+        }
+    }
+
+    /**
+     * Start streaming as sender (host).
+     * Uses the first passthrough camera by default.
+     */
+    fun startStreamingSender() {
+        if (webRTCManager == null) {
+            streamLog.error("WebRTC not initialized — cannot start sender")
+            _uiState.value = _uiState.value.copy(
+                streamingState = StreamingState.ERROR
+            )
+            return
+        }
+
+        val passthrough = _uiState.value.passthroughCluster.cameras.firstOrNull()
+        if (passthrough == null) {
+            streamLog.warn("No passthrough camera available for streaming — trying to enumerate")
+            // Try to enumerate cameras first
+            if (_uiState.value.hasCameraPermission) {
+                viewModelScope.launch(Dispatchers.IO) {
+                    val cameras = CameraBridge.enumerateCameras()
+                    val ptCameras = cameras.filter { it.clusterType == CameraClusterType.PASSTHROUGH }
+                    withContext(Dispatchers.Main) {
+                        _uiState.value = _uiState.value.copy(
+                            passthroughCluster = _uiState.value.passthroughCluster.copy(
+                                cameras = ptCameras,
+                                selectedCameraId = ptCameras.firstOrNull()?.id
+                            )
+                        )
+                        // Retry with freshly enumerated cameras
+                        val cam = ptCameras.firstOrNull()
+                        if (cam != null) {
+                            streamLog.info("Found camera after enumeration, starting sender", mapOf(
+                                "cameraId" to cam.id,
+                                "resolution" to "${cam.width}x${cam.height}"
+                            ))
+                            webRTCManager?.startAsSender(cam.id, cam.width, cam.height)
+                        } else {
+                            streamLog.error("No passthrough cameras found on device")
+                            _uiState.value = _uiState.value.copy(
+                                streamingState = StreamingState.ERROR
+                            )
+                        }
+                    }
+                }
+            } else {
+                streamLog.error("No camera permission — cannot start sender")
+                _uiState.value = _uiState.value.copy(
+                    streamingState = StreamingState.ERROR
+                )
+            }
+            return
+        }
+
+        streamLog.info("Starting as sender", mapOf(
+            "cameraId" to passthrough.id,
+            "resolution" to "${passthrough.width}x${passthrough.height}"
+        ))
+
+        webRTCManager?.startAsSender(passthrough.id, passthrough.width, passthrough.height)
+    }
+
+    /**
+     * Start streaming as receiver, connecting to a sender.
+     */
+    fun startStreamingReceiver(remoteIp: String) {
+        streamLog.info("Starting as receiver, connecting to $remoteIp")
+        webRTCManager?.startAsReceiver(remoteIp)
+    }
+
+    /**
+     * Stop the streaming session.
+     */
+    fun stopStreaming() {
+        streamLog.info("Stopping streaming")
+        webRTCManager?.stop()
+        _uiState.value = _uiState.value.copy(
+            streamingState = StreamingState.DISCONNECTED,
+            remoteVideoTrack = null
+        )
+    }
+
+    /**
+     * Update remote IP address.
+     */
+    fun updateRemoteIp(ip: String) {
+        _uiState.value = _uiState.value.copy(remoteIp = ip)
     }
 
     // ==========================================================================
@@ -445,7 +636,8 @@ class SensorViewModel : ViewModel() {
                 NavigationDestination.EyeTrackingCameras -> _uiState.value.copy(
                     eyeTrackingCluster = _uiState.value.eyeTrackingCluster.copy(stats = stats)
                 )
-                NavigationDestination.ImuSensors -> _uiState.value
+                NavigationDestination.ImuSensors,
+                NavigationDestination.Streaming -> _uiState.value
             }
         }
     }
@@ -459,8 +651,10 @@ class SensorViewModel : ViewModel() {
 
     override fun onCleared() {
         super.onCleared()
-        log.info("ViewModel cleared, stopping sensors")
+        log.info("ViewModel cleared, stopping sensors and streaming")
         stopSensors()
+        webRTCManager?.release()
+        webRTCManager = null
     }
 
     companion object {

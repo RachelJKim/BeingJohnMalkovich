@@ -11,6 +11,7 @@
 #include "imu_manager.h"
 #include "camera_manager.h"
 #include "camera_stream.h"
+#include "camera_encoder_bridge.h"
 #include "jni_helpers.h"
 
 namespace {
@@ -30,6 +31,15 @@ std::mutex g_imuMutex;
 std::unique_ptr<nativesensor::CameraManager> g_cameraManager;
 std::unordered_map<std::string, std::unique_ptr<nativesensor::CameraStream>> g_cameraStreams;
 std::mutex g_cameraMutex;
+
+// Encoder bridge for frame capture (streaming)
+std::unique_ptr<nativesensor::CameraEncoderBridge> g_encoderBridge;
+std::mutex g_encoderMutex;
+
+// JVM reference for encoder callbacks
+JavaVM* g_jvm = nullptr;
+jobject g_frameCallbackObj = nullptr;
+jmethodID g_onFrameMethod = nullptr;
 
 nativesensor::ImuManager* getImuManager() {
     std::lock_guard<std::mutex> lock(g_imuMutex);
@@ -79,12 +89,13 @@ void stopAllCameraStreams() {
     g_cameraStreams.clear();
 }
 
-// No-op JNI_OnLoad, but required for JNI linkage
-JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
+// JNI_OnLoad - capture JVM reference for encoder callbacks
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /*reserved*/) {
     JNIEnv* env;
     if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
         return JNI_ERR;
     }
+    g_jvm = vm;
     LOGI("Native sensor library loaded successfully");
     return JNI_VERSION_1_6;
 }
@@ -422,6 +433,140 @@ Java_com_tw0b33rs_nativesensoraccess_sensor_CameraBridge_nativeGetActiveStreamCo
         }
     }
     return count;
+}
+
+// =============================================================================
+// Encoder Bridge JNI Functions (StreamingBridge)
+// =============================================================================
+
+JNIEXPORT void JNICALL
+Java_com_tw0b33rs_nativesensoraccess_streaming_StreamingBridge_nativeSetFrameCallback(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jobject callback) {
+    std::lock_guard<std::mutex> lock(g_encoderMutex);
+
+    // Release previous callback if any
+    if (g_frameCallbackObj) {
+        env->DeleteGlobalRef(g_frameCallbackObj);
+        g_frameCallbackObj = nullptr;
+        g_onFrameMethod = nullptr;
+    }
+
+    if (callback) {
+        g_frameCallbackObj = env->NewGlobalRef(callback);
+        jclass callbackClass = env->GetObjectClass(callback);
+        g_onFrameMethod = env->GetMethodID(callbackClass, "onFrame", "([BIIJ)V");
+        if (!g_onFrameMethod) {
+            LOGE("Failed to find onFrame method in callback");
+            env->DeleteGlobalRef(g_frameCallbackObj);
+            g_frameCallbackObj = nullptr;
+        } else {
+            LOGI("Frame callback registered");
+        }
+        env->DeleteLocalRef(callbackClass);
+    } else {
+        LOGI("Frame callback cleared");
+    }
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_tw0b33rs_nativesensoraccess_streaming_StreamingBridge_nativeStartFrameCapture(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jstring cameraId,
+    jint width,
+    jint height) {
+    const char* idStr = env->GetStringUTFChars(cameraId, nullptr);
+    std::string id(idStr);
+    env->ReleaseStringUTFChars(cameraId, idStr);
+
+    LOGI("StreamingBridge.nativeStartFrameCapture(%s, %dx%d)", id.c_str(), width, height);
+
+    auto* manager = getCameraManager();
+
+    std::lock_guard<std::mutex> lock(g_encoderMutex);
+    if (!g_encoderBridge) {
+        g_encoderBridge = std::make_unique<nativesensor::CameraEncoderBridge>(*manager);
+    }
+
+    // Create frame callback that forwards to Java
+    auto frameCallback = [](const uint8_t* data, int32_t size,
+                            int32_t w, int32_t h, int64_t timestampNs) {
+        if (!g_jvm || !g_frameCallbackObj || !g_onFrameMethod) return;
+
+        JNIEnv* callbackEnv = nullptr;
+        bool needDetach = false;
+        int envStatus = g_jvm->GetEnv(reinterpret_cast<void**>(&callbackEnv), JNI_VERSION_1_6);
+
+        if (envStatus == JNI_EDETACHED) {
+            if (g_jvm->AttachCurrentThread(&callbackEnv, nullptr) == JNI_OK) {
+                needDetach = true;
+            } else {
+                return;
+            }
+        } else if (envStatus != JNI_OK) {
+            return;
+        }
+
+        // Create byte array and copy frame data
+        jbyteArray jdata = callbackEnv->NewByteArray(size);
+        if (jdata) {
+            callbackEnv->SetByteArrayRegion(jdata, 0, size,
+                                             reinterpret_cast<const jbyte*>(data));
+
+            // Call Java callback: onFrame(byte[] data, int width, int height, long timestampNs)
+            callbackEnv->CallVoidMethod(g_frameCallbackObj, g_onFrameMethod,
+                                         jdata, w, h, timestampNs);
+            callbackEnv->DeleteLocalRef(jdata);
+        }
+
+        if (needDetach) {
+            g_jvm->DetachCurrentThread();
+        }
+    };
+
+    bool success = g_encoderBridge->startCapture(id, width, height, frameCallback);
+    return success ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_tw0b33rs_nativesensoraccess_streaming_StreamingBridge_nativeStopFrameCapture(
+    JNIEnv* /* env */,
+    jobject /* thiz */) {
+    LOGI("StreamingBridge.nativeStopFrameCapture()");
+    std::lock_guard<std::mutex> lock(g_encoderMutex);
+    if (g_encoderBridge) {
+        g_encoderBridge->stopCapture();
+    }
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_tw0b33rs_nativesensoraccess_streaming_StreamingBridge_nativeIsCapturing(
+    JNIEnv* /* env */,
+    jobject /* thiz */) {
+    std::lock_guard<std::mutex> lock(g_encoderMutex);
+    if (g_encoderBridge) {
+        return g_encoderBridge->isCapturing() ? JNI_TRUE : JNI_FALSE;
+    }
+    return JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_tw0b33rs_nativesensoraccess_streaming_StreamingBridge_nativeReleaseEncoder(
+    JNIEnv* env,
+    jobject /* thiz */) {
+    LOGI("StreamingBridge.nativeReleaseEncoder()");
+    std::lock_guard<std::mutex> lock(g_encoderMutex);
+    if (g_encoderBridge) {
+        g_encoderBridge->stopCapture();
+        g_encoderBridge.reset();
+    }
+    if (g_frameCallbackObj) {
+        env->DeleteGlobalRef(g_frameCallbackObj);
+        g_frameCallbackObj = nullptr;
+        g_onFrameMethod = nullptr;
+    }
 }
 
 }  // extern "C"
