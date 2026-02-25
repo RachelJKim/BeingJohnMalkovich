@@ -35,6 +35,7 @@ data class SignalingMessage(
  * Listener for incoming signaling messages.
  */
 interface SignalingListener {
+    fun onPeerConnected()
     fun onOfferReceived(sdp: String)
     fun onAnswerReceived(sdp: String)
     fun onIceCandidateReceived(sdpMid: String, sdpMLineIndex: Int, candidate: String)
@@ -75,6 +76,7 @@ class SignalingServer(
                 log.info("Peer connected from ${socket.inetAddress.hostAddress}")
 
                 setupConnection(socket)
+                listener.onPeerConnected()
                 readLoop()
             } catch (e: SocketException) {
                 if (running) {
@@ -100,6 +102,7 @@ class SignalingServer(
                 log.info("Connected to signaling server")
 
                 setupConnection(socket)
+                listener.onPeerConnected()
                 readLoop()
             } catch (e: Exception) {
                 log.error("Failed to connect to server", throwable = e)

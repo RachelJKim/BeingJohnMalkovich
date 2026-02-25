@@ -137,29 +137,10 @@ class WebRTCManager(
         role = StreamingRole.RECEIVER
         updateState(StreamingState.CONNECTING)
 
-        // Connect to signaling server
+        // Connect to signaling server — the offer/answer exchange
+        // happens in onPeerConnected() after TCP is established
         signalingServer = SignalingServer(this)
         signalingServer?.connectToServer(remoteIp)
-
-        // Create peer connection and send offer
-        createPeerConnection()
-
-        // For receiver, we create an offer to request the stream
-        peerConnection?.createOffer(object : SdpObserverAdapter() {
-            override fun onCreateSuccess(sdp: SessionDescription) {
-                log.info("Offer created")
-                peerConnection?.setLocalDescription(SdpObserverAdapter(), sdp)
-                signalingServer?.send(SignalingMessage(
-                    type = SignalingMessageType.OFFER,
-                    sdp = sdp.description
-                ))
-            }
-
-            override fun onCreateFailure(error: String) {
-                log.error("Failed to create offer: $error")
-                stateListener.onError("Failed to create offer: $error")
-            }
-        }, MediaConstraints())
 
         log.info("Started as receiver, connecting to $remoteIp")
     }
@@ -219,6 +200,37 @@ class WebRTCManager(
     // =========================================================================
     // Signaling Listener
     // =========================================================================
+
+    override fun onPeerConnected() {
+        log.info("Signaling TCP connection established (role: $role)")
+        updateState(StreamingState.CONNECTING)
+
+        if (role == StreamingRole.SENDER) {
+            // Sender creates peer connection and sends the offer
+            createPeerConnection()
+
+            val constraints = MediaConstraints().apply {
+                mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
+            }
+
+            peerConnection?.createOffer(object : SdpObserverAdapter() {
+                override fun onCreateSuccess(sdp: SessionDescription) {
+                    log.info("Offer created by sender")
+                    peerConnection?.setLocalDescription(SdpObserverAdapter(), sdp)
+                    signalingServer?.send(SignalingMessage(
+                        type = SignalingMessageType.OFFER,
+                        sdp = sdp.description
+                    ))
+                }
+
+                override fun onCreateFailure(error: String) {
+                    log.error("Failed to create offer: $error")
+                    stateListener.onError("Failed to create offer: $error")
+                }
+            }, constraints)
+        }
+        // Receiver just waits for the offer — handled in onOfferReceived()
+    }
 
     override fun onOfferReceived(sdp: String) {
         log.info("Received offer from peer")
